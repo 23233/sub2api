@@ -207,6 +207,10 @@ vi.mock("vue-i18n", async () => {
     "admin.settings.openaiExperimentalScheduler.stickyWeightedDescription": "开启后 previous_response_id 和 session_hash 粘性进入高级调度打分；关闭时仍按旧逻辑硬命中粘性账号。",
     "admin.settings.openaiExperimentalScheduler.subscriptionPriorityTitle": "订阅优先",
     "admin.settings.openaiExperimentalScheduler.subscriptionPriorityDescription": "开启后先在 ChatGPT 订阅账号池中按权值选取；订阅池拿不到席位时再回退到非订阅账号池。",
+    "admin.settings.openaiExperimentalScheduler.cacheMinRateTitle": "最低缓存命中率",
+    "admin.settings.openaiExperimentalScheduler.cacheMinRateDescription": "低于阈值的账号会暂时熔断，等待恢复探测。",
+    "admin.settings.openaiExperimentalScheduler.cacheRecoveryMinutesTitle": "缓存熔断恢复时间",
+    "admin.settings.openaiExperimentalScheduler.cacheRecoveryMinutesDescription": "熔断后等待这段时间再允许一次探测请求。",
     "admin.settings.openaiExperimentalScheduler.weightsTitle": "调度权值覆盖",
     "admin.settings.openaiExperimentalScheduler.weightsDescription": "留空时使用配置/环境变量值；配置未设置时使用内置默认值。页面非空设置优先。",
     "admin.settings.openaiExperimentalScheduler.defaultPlaceholder": "配置/默认：{value}",
@@ -505,6 +509,8 @@ const baseSettingsResponse = {
   openai_advanced_scheduler_enabled: false,
   openai_advanced_scheduler_sticky_weighted_enabled: false,
   openai_advanced_scheduler_subscription_priority_enabled: false,
+  openai_advanced_scheduler_cache_min_rate: 80,
+  openai_advanced_scheduler_cache_recovery_minutes: 15,
   openai_advanced_scheduler_lb_top_k: "",
   openai_advanced_scheduler_weight_priority: "",
   openai_advanced_scheduler_weight_load: "",
@@ -1448,6 +1454,32 @@ describe("admin SettingsView payment visible method controls", () => {
       weightedModeText.indexOf("调度权值覆盖"),
     );
     expect(weightedModeText).toContain("计费倍率");
+  });
+
+  it("loads and saves the OpenAI cache gate and recovery policy", async () => {
+    const wrapper = mountView();
+
+    await flushPromises();
+    await wrapper
+      .get('[data-testid="openai-advanced-scheduler-toggle"]')
+      .setValue(true);
+
+    const minRate = wrapper.get('[data-testid="openai-cache-min-rate"]');
+    const recovery = wrapper.get('[data-testid="openai-cache-recovery-minutes"]');
+    expect((minRate.element as HTMLInputElement).value).toBe("80");
+    expect((recovery.element as HTMLInputElement).value).toBe("15");
+
+    await minRate.setValue(85);
+    await recovery.setValue(22);
+    await wrapper.find("form").trigger("submit.prevent");
+    await flushPromises();
+
+    expect(updateSettings).toHaveBeenCalledWith(
+      expect.objectContaining({
+        openai_advanced_scheduler_cache_min_rate: 85,
+        openai_advanced_scheduler_cache_recovery_minutes: 22,
+      }),
+    );
   });
 
   it("passes translated upload and remove labels to the payment help image uploader", async () => {

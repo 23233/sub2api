@@ -343,6 +343,143 @@ func TestOpenAIGatewayServiceRecordUsage_ZeroUsageStillWritesUsageLog(t *testing
 	require.Zero(t, billingRepo.lastCmd.AccountQuotaCost)
 }
 
+func TestOpenAIGatewayServiceRecordUsage_ReportsCacheAndAccountCostToScheduler(t *testing.T) {
+	resetOpenAIAdvancedSchedulerSettingCacheForTest()
+	t.Cleanup(resetOpenAIAdvancedSchedulerSettingCacheForTest)
+	usageRepo := &openAIRecordUsageLogRepoStub{inserted: true}
+	billingRepo := &openAIRecordUsageBillingRepoStub{result: &UsageBillingApplyResult{Applied: true}}
+	svc := newOpenAIRecordUsageServiceWithBillingRepoForTest(
+		usageRepo,
+		billingRepo,
+		&openAIRecordUsageUserRepoStub{},
+		&openAIRecordUsageSubRepoStub{},
+		nil,
+	)
+	svc.rateLimitService = &RateLimitService{settingService: NewSettingService(
+		&openAIAdvancedSchedulerSettingRepoStub{values: map[string]string{
+			openAIAdvancedSchedulerSettingKey:             "true",
+			SettingKeyOpenAIAdvancedSchedulerCacheMinRate: "80",
+		}},
+		svc.cfg,
+	)}
+	accountRate := 0.4
+	account := &Account{
+		ID:             31001,
+		Platform:       PlatformOpenAI,
+		Type:           AccountTypeAPIKey,
+		RateMultiplier: &accountRate,
+	}
+
+	err := svc.RecordUsage(context.Background(), &OpenAIRecordUsageInput{
+		Result: &OpenAIForwardResult{
+			RequestID:     "resp_scheduler_cache_usage",
+			Model:         "gpt-5.1",
+			UpstreamModel: "gpt-5.1",
+			Usage: OpenAIUsage{
+				InputTokens:              100_000,
+				CacheCreationInputTokens: 10_000,
+				CacheReadInputTokens:     80_000,
+			},
+			Duration: time.Second,
+		},
+		APIKey:  &APIKey{ID: 11001, Group: &Group{RateMultiplier: 1}},
+		User:    &User{ID: 21001},
+		Account: account,
+	})
+	require.NoError(t, err)
+	require.NotNil(t, usageRepo.lastLog)
+	require.Equal(t, 10_000, usageRepo.lastLog.InputTokens)
+	require.Equal(t, 10_000, usageRepo.lastLog.CacheCreationTokens)
+	require.Equal(t, 80_000, usageRepo.lastLog.CacheReadTokens)
+
+	decision := svc.openaiAccountStats.cacheDecisionAt(account.ID, "gpt-5.1", 0.80, time.Now())
+	require.Equal(t, openAIAccountCacheHealthy, decision.state)
+	require.Equal(t, int64(100_000), decision.sampleTokens)
+	require.InDelta(t, 0.80, decision.cacheRate, 1e-9)
+	require.True(t, decision.hasObservedCost)
+	require.InDelta(t, usageRepo.lastLog.TotalCost*accountRate/100_000, decision.observedCost, 1e-12)
+}
+
+func TestOpenAIGatewayServiceRecordUsage_ReportsCacheOnlyInputToScheduler(t *testing.T) {
+	resetOpenAIAdvancedSchedulerSettingCacheForTest()
+	t.Cleanup(resetOpenAIAdvancedSchedulerSettingCacheForTest)
+	usageRepo := &openAIRecordUsageLogRepoStub{inserted: true}
+	billingRepo := &openAIRecordUsageBillingRepoStub{result: &UsageBillingApplyResult{Applied: true}}
+	svc := newOpenAIRecordUsageServiceWithBillingRepoForTest(
+		usageRepo,
+		billingRepo,
+		&openAIRecordUsageUserRepoStub{},
+		&openAIRecordUsageSubRepoStub{},
+		nil,
+	)
+	svc.rateLimitService = &RateLimitService{settingService: NewSettingService(
+		&openAIAdvancedSchedulerSettingRepoStub{values: map[string]string{
+			openAIAdvancedSchedulerSettingKey:             "true",
+			SettingKeyOpenAIAdvancedSchedulerCacheMinRate: "80",
+		}},
+		svc.cfg,
+	)}
+
+	account := &Account{ID: 31002, Platform: PlatformOpenAI, Type: AccountTypeAPIKey}
+	err := svc.RecordUsage(context.Background(), &OpenAIRecordUsageInput{
+		Result: &OpenAIForwardResult{
+			RequestID: "resp_scheduler_cache_only",
+			Model:     "gpt-5.1",
+			Usage: OpenAIUsage{
+				CacheReadInputTokens: 9_000,
+			},
+			Duration: time.Second,
+		},
+		InboundEndpoint: "/v1/chat/completions",
+		APIKey:          &APIKey{ID: 11002, Group: &Group{RateMultiplier: 1}},
+		User:            &User{ID: 21002},
+		Account:         account,
+	})
+	require.NoError(t, err)
+	require.NotNil(t, svc.openaiAccountStats)
+	decision := svc.openaiAccountStats.cacheDecisionAt(account.ID, "gpt-5.1", 0.80, time.Now())
+	require.Equal(t, int64(9_000), decision.sampleTokens)
+	require.InDelta(t, 1.0, decision.cacheRate, 1e-9)
+}
+
+func TestOpenAIGatewayServiceRecordUsage_DoesNotFeedNonPromptEndpointsToCacheStats(t *testing.T) {
+	resetOpenAIAdvancedSchedulerSettingCacheForTest()
+	t.Cleanup(resetOpenAIAdvancedSchedulerSettingCacheForTest)
+	usageRepo := &openAIRecordUsageLogRepoStub{inserted: true}
+	billingRepo := &openAIRecordUsageBillingRepoStub{result: &UsageBillingApplyResult{Applied: true}}
+	svc := newOpenAIRecordUsageServiceWithBillingRepoForTest(
+		usageRepo,
+		billingRepo,
+		&openAIRecordUsageUserRepoStub{},
+		&openAIRecordUsageSubRepoStub{},
+		nil,
+	)
+	svc.rateLimitService = &RateLimitService{settingService: NewSettingService(
+		&openAIAdvancedSchedulerSettingRepoStub{values: map[string]string{
+			openAIAdvancedSchedulerSettingKey:             "true",
+			SettingKeyOpenAIAdvancedSchedulerCacheMinRate: "80",
+		}},
+		svc.cfg,
+	)}
+
+	err := svc.RecordUsage(context.Background(), &OpenAIRecordUsageInput{
+		Result: &OpenAIForwardResult{
+			RequestID: "resp_scheduler_embeddings_usage",
+			Model:     "text-embedding-3-large",
+			Usage: OpenAIUsage{
+				InputTokens: 9_000,
+			},
+			Duration: time.Second,
+		},
+		InboundEndpoint: "/v1/embeddings",
+		APIKey:          &APIKey{ID: 11003, Group: &Group{RateMultiplier: 1}},
+		User:            &User{ID: 21003},
+		Account:         &Account{ID: 31003, Platform: PlatformOpenAI, Type: AccountTypeAPIKey},
+	})
+	require.NoError(t, err)
+	require.Nil(t, svc.openaiAccountStats)
+}
+
 func TestOpenAIGatewayServiceRecordUsage_MissingPricingRecordsZeroCostUsageLog(t *testing.T) {
 	usageRepo := &openAIRecordUsageLogRepoStub{inserted: true}
 	billingRepo := &openAIRecordUsageBillingRepoStub{result: &UsageBillingApplyResult{Applied: true}}

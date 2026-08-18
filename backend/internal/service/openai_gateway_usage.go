@@ -425,7 +425,27 @@ func (s *OpenAIGatewayService) RecordUsage(ctx context.Context, input *OpenAIRec
 			tokens, cost.TotalCost,
 		)
 	}
-
+	// Feed the OpenAI scheduler from upstream usage, using account-side cost
+	// rather than the user's downstream multiplier. This runs after the usage
+	// row's account pricing has been resolved, but before asynchronous billing.
+	if account != nil && NormalizeOpenAICompatiblePlatform(account.Platform) == PlatformOpenAI &&
+		openAIPromptCacheUsageEligible(input, result) &&
+		(result.Usage.InputTokens > 0 || result.Usage.CacheCreationInputTokens > 0 || result.Usage.CacheReadInputTokens > 0) {
+		accountCost := usageLog.TotalCost * accountRateMultiplier
+		if usageLog.AccountStatsCost != nil {
+			accountCost = *usageLog.AccountStatsCost
+		}
+		scheduleModel := sentModel
+		if scheduleModel == "" {
+			scheduleModel = result.Model
+		}
+		s.ReportOpenAIAccountScheduleUsage(account.ID, scheduleModel, OpenAIAccountScheduleUsage{
+			InputTokens:         actualInputTokens,
+			CacheCreationTokens: result.Usage.CacheCreationInputTokens,
+			CacheReadTokens:     result.Usage.CacheReadInputTokens,
+			AccountCost:         accountCost,
+		})
+	}
 	if s.cfg != nil && s.cfg.RunMode == config.RunModeSimple {
 		writeUsageLogBestEffort(ctx, s.usageLogRepo, usageLog, "service.openai_gateway")
 		logger.LegacyPrintf("service.openai_gateway", "[SIMPLE MODE] Usage recorded (not billed): user=%d, tokens=%d", usageLog.UserID, usageLog.TotalTokens())
@@ -464,6 +484,26 @@ func (s *OpenAIGatewayService) RecordUsage(ctx context.Context, input *OpenAIRec
 	writeUsageLogBestEffort(ctx, s.usageLogRepo, usageLog, "service.openai_gateway")
 
 	return nil
+}
+
+// openAIPromptCacheUsageEligible keeps non-prompt OpenAI endpoints from
+// poisoning the per-account cache-rate window. An empty endpoint is allowed
+// for internal callers that predate endpoint metadata.
+func openAIPromptCacheUsageEligible(input *OpenAIRecordUsageInput, result *OpenAIForwardResult) bool {
+	if input == nil || result == nil {
+		return false
+	}
+	if result.ImageCount > 0 || result.VideoCount > 0 || result.AudioUsage != nil ||
+		result.WebSearchCalls > 0 || result.SearchCount > 0 {
+		return false
+	}
+	endpoint := strings.ToLower(strings.TrimSpace(input.InboundEndpoint + " " + input.UpstreamEndpoint))
+	for _, marker := range []string{"/embeddings", "/images/", "/audio/", "/videos/", "/alpha/search"} {
+		if strings.Contains(endpoint, marker) {
+			return false
+		}
+	}
+	return true
 }
 
 // hasIdentifiedOpenAIResponsePricing 判断上游自报的响应模型是否可以作为计费基准，

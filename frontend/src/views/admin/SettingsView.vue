@@ -5153,6 +5153,64 @@
 
               <div
                 v-if="form.openai_advanced_scheduler_enabled"
+                class="grid grid-cols-1 gap-5 border-t border-gray-100 pt-5 md:grid-cols-2 dark:border-dark-700"
+              >
+                <div>
+                  <label
+                    class="text-sm font-medium text-gray-700 dark:text-gray-300"
+                    for="openai-cache-min-rate"
+                  >
+                    {{ t("admin.settings.openaiExperimentalScheduler.cacheMinRateTitle") }}
+                  </label>
+                  <p class="mt-0.5 text-xs text-gray-500 dark:text-gray-400">
+                    {{ t("admin.settings.openaiExperimentalScheduler.cacheMinRateDescription") }}
+                  </p>
+                  <div class="relative mt-3 w-full sm:w-40">
+                    <input
+                      id="openai-cache-min-rate"
+                      v-model.number="form.openai_advanced_scheduler_cache_min_rate"
+                      class="input pr-8"
+                      data-testid="openai-cache-min-rate"
+                      min="0"
+                      max="100"
+                      step="1"
+                      type="number"
+                    />
+                    <span
+                      class="pointer-events-none absolute right-3 top-1/2 -translate-y-1/2 text-sm text-gray-400"
+                    >%</span>
+                  </div>
+                </div>
+                <div>
+                  <label
+                    class="text-sm font-medium text-gray-700 dark:text-gray-300"
+                    for="openai-cache-recovery-minutes"
+                  >
+                    {{ t("admin.settings.openaiExperimentalScheduler.cacheRecoveryMinutesTitle") }}
+                  </label>
+                  <p class="mt-0.5 text-xs text-gray-500 dark:text-gray-400">
+                    {{ t("admin.settings.openaiExperimentalScheduler.cacheRecoveryMinutesDescription") }}
+                  </p>
+                  <div class="relative mt-3 w-full sm:w-40">
+                    <input
+                      id="openai-cache-recovery-minutes"
+                      v-model.number="form.openai_advanced_scheduler_cache_recovery_minutes"
+                      class="input pr-12"
+                      data-testid="openai-cache-recovery-minutes"
+                      min="1"
+                      max="360"
+                      step="1"
+                      type="number"
+                    />
+                    <span
+                      class="pointer-events-none absolute right-3 top-1/2 -translate-y-1/2 text-sm text-gray-400"
+                    >min</span>
+                  </div>
+                </div>
+              </div>
+
+              <div
+                v-if="form.openai_advanced_scheduler_enabled"
                 class="border-t border-gray-100 pt-5 dark:border-dark-700"
               >
                 <div>
@@ -9444,6 +9502,8 @@ type SettingsForm = Omit<
   openai_advanced_scheduler_enabled: boolean;
   openai_advanced_scheduler_sticky_weighted_enabled: boolean;
   openai_advanced_scheduler_subscription_priority_enabled: boolean;
+  openai_advanced_scheduler_cache_min_rate: number;
+  openai_advanced_scheduler_cache_recovery_minutes: number;
   openai_advanced_scheduler_lb_top_k: string;
   openai_advanced_scheduler_weight_priority: string;
   openai_advanced_scheduler_weight_load: string;
@@ -9686,6 +9746,8 @@ const form = reactive<SettingsForm>({
   openai_advanced_scheduler_enabled: false,
   openai_advanced_scheduler_sticky_weighted_enabled: false,
   openai_advanced_scheduler_subscription_priority_enabled: false,
+  openai_advanced_scheduler_cache_min_rate: 80,
+  openai_advanced_scheduler_cache_recovery_minutes: 15,
   openai_advanced_scheduler_lb_top_k: "",
   openai_advanced_scheduler_weight_priority: "",
   openai_advanced_scheduler_weight_load: "",
@@ -11344,6 +11406,10 @@ async function saveSettings() {
         form.openai_advanced_scheduler_sticky_weighted_enabled,
       openai_advanced_scheduler_subscription_priority_enabled:
         form.openai_advanced_scheduler_subscription_priority_enabled,
+      openai_advanced_scheduler_cache_min_rate:
+        Number(form.openai_advanced_scheduler_cache_min_rate),
+      openai_advanced_scheduler_cache_recovery_minutes:
+        Math.floor(Number(form.openai_advanced_scheduler_cache_recovery_minutes)),
       openai_advanced_scheduler_lb_top_k:
         form.openai_advanced_scheduler_lb_top_k.trim(),
       openai_advanced_scheduler_weight_priority:

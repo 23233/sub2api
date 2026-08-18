@@ -10,6 +10,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/Wei-Shaw/sub2api/internal/config"
 	"github.com/Wei-Shaw/sub2api/internal/pkg/antigravity"
@@ -246,6 +247,8 @@ func (s *SettingService) InitializeDefaultSettings(ctx context.Context) error {
 		openAIAdvancedSchedulerSettingKey:                            "false",
 		SettingKeyOpenAIAdvancedSchedulerStickyWeightedEnabled:       "false",
 		SettingKeyOpenAIAdvancedSchedulerSubscriptionPriorityEnabled: "false",
+		SettingKeyOpenAIAdvancedSchedulerCacheMinRate:                "80",
+		SettingKeyOpenAIAdvancedSchedulerCacheRecoveryMinutes:        "15",
 		SettingKeyOpenAIAdvancedSchedulerLBTopK:                      "",
 		SettingKeyOpenAIAdvancedSchedulerWeightPriority:              "",
 		SettingKeyOpenAIAdvancedSchedulerWeightLoad:                  "",
@@ -903,6 +906,8 @@ func (s *SettingService) parseSettings(settings map[string]string) *SystemSettin
 	result.OpenAIAdvancedSchedulerEnabled = settings[openAIAdvancedSchedulerSettingKey] == "true"
 	result.OpenAIAdvancedSchedulerStickyWeightedEnabled = settings[SettingKeyOpenAIAdvancedSchedulerStickyWeightedEnabled] == "true"
 	result.OpenAIAdvancedSchedulerSubscriptionPriorityEnabled = settings[SettingKeyOpenAIAdvancedSchedulerSubscriptionPriorityEnabled] == "true"
+	result.OpenAIAdvancedSchedulerCacheMinRate = parseOpenAIAdvancedSchedulerCacheMinRate(settings[SettingKeyOpenAIAdvancedSchedulerCacheMinRate]) * 100
+	result.OpenAIAdvancedSchedulerCacheRecoveryMinutes = parseOpenAIAdvancedSchedulerCacheRecoveryMinutes(settings[SettingKeyOpenAIAdvancedSchedulerCacheRecoveryMinutes])
 	result.OpenAIAdvancedSchedulerLBTopK = strings.TrimSpace(settings[SettingKeyOpenAIAdvancedSchedulerLBTopK])
 	result.OpenAIAdvancedSchedulerWeightPriority = strings.TrimSpace(settings[SettingKeyOpenAIAdvancedSchedulerWeightPriority])
 	result.OpenAIAdvancedSchedulerWeightLoad = strings.TrimSpace(settings[SettingKeyOpenAIAdvancedSchedulerWeightLoad])
@@ -1050,6 +1055,20 @@ func formatOpenAIAdvancedSchedulerFloat(value float64) string {
 func (s *SettingService) normalizeOpenAIAdvancedSchedulerOverrides(settings *SystemSettings) error {
 	if rate := settings.OpenAIOAuthSchedulingRateMultiplier; rate < 0 || math.IsNaN(rate) || math.IsInf(rate, 0) {
 		return infraerrors.BadRequest("INVALID_OPENAI_OAUTH_SCHEDULING_RATE_MULTIPLIER", "OpenAI OAuth scheduling rate multiplier must be a finite non-negative number")
+	}
+	if rate := settings.OpenAIAdvancedSchedulerCacheMinRate; rate < 0 || rate > 100 || math.IsNaN(rate) || math.IsInf(rate, 0) {
+		return infraerrors.BadRequest("INVALID_OPENAI_ADVANCED_SCHEDULER_CACHE_MIN_RATE", "openai advanced scheduler cache minimum rate must be between 0 and 100")
+	}
+	maxRecoveryMinutes := int(openAIAccountCacheMaxRecovery / time.Minute)
+	// A zero value can come from older callers that construct SystemSettings
+	// directly and do not know about this newer field. Preserve that contract
+	// by treating zero as the default; explicit negative/out-of-range values
+	// remain invalid.
+	if settings.OpenAIAdvancedSchedulerCacheRecoveryMinutes == 0 {
+		settings.OpenAIAdvancedSchedulerCacheRecoveryMinutes = int(defaultOpenAIAccountCacheRecovery / time.Minute)
+	}
+	if settings.OpenAIAdvancedSchedulerCacheRecoveryMinutes < 0 || settings.OpenAIAdvancedSchedulerCacheRecoveryMinutes > maxRecoveryMinutes {
+		return infraerrors.BadRequest("INVALID_OPENAI_ADVANCED_SCHEDULER_CACHE_RECOVERY_MINUTES", "openai advanced scheduler cache recovery minutes must be between 1 and 360")
 	}
 
 	lbTopK, err := normalizeOptionalPositiveIntString(settings.OpenAIAdvancedSchedulerLBTopK)

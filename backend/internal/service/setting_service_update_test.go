@@ -552,6 +552,26 @@ func TestSettingService_GetAllSettings_OpenAIAdvancedSchedulerEffectiveValuesUse
 	require.Equal(t, "11", settings.OpenAIAdvancedSchedulerEffectiveWeightSessionSticky)
 }
 
+func TestSettingService_UpdateSettings_PersistsOpenAICachePolicy(t *testing.T) {
+	repo := &settingUpdateRepoStub{}
+	svc := NewSettingService(repo, &config.Config{})
+
+	err := svc.UpdateSettings(context.Background(), &SystemSettings{
+		OpenAIAdvancedSchedulerCacheMinRate:         85,
+		OpenAIAdvancedSchedulerCacheRecoveryMinutes: 22,
+	})
+	require.NoError(t, err)
+	require.Equal(t, "85", repo.updates[SettingKeyOpenAIAdvancedSchedulerCacheMinRate])
+	require.Equal(t, "22", repo.updates[SettingKeyOpenAIAdvancedSchedulerCacheRecoveryMinutes])
+}
+
+func TestSettingService_ParseSettings_OpenAICachePolicyDefaults(t *testing.T) {
+	svc := NewSettingService(&settingUpdateRepoStub{}, &config.Config{})
+	settings := svc.parseSettings(map[string]string{})
+	require.Equal(t, float64(80), settings.OpenAIAdvancedSchedulerCacheMinRate)
+	require.Equal(t, 15, settings.OpenAIAdvancedSchedulerCacheRecoveryMinutes)
+}
+
 func TestSettingService_UpdateSettings_AntigravityUserAgentVersion(t *testing.T) {
 	repo := &settingUpdateRepoStub{}
 	svc := NewSettingService(repo, &config.Config{})

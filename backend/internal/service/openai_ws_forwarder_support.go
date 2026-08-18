@@ -407,6 +407,10 @@ func (s *OpenAIGatewayService) selectAccountByPreviousResponseIDForCapability(
 		return nil, nil
 	}
 
+	cacheModel, cacheProbeReserved, cacheAllowed := s.beginOpenAICacheProbe(ctx, account, requestedModel)
+	if !cacheAllowed {
+		return nil, nil
+	}
 	result, acquireErr := s.tryAcquireAccountSlot(ctx, accountID, account.Concurrency)
 	if acquireErr == nil && result.Acquired {
 		logOpenAIWSBindResponseAccountWarn(
@@ -420,6 +424,15 @@ func (s *OpenAIGatewayService) selectAccountByPreviousResponseIDForCapability(
 			Acquired:    true,
 			ReleaseFunc: result.ReleaseFunc,
 		}), nil
+	}
+	if cacheProbeReserved {
+		s.cancelOpenAICacheProbe(accountID, cacheModel)
+		if acquireErr != nil {
+			return nil, acquireErr
+		}
+		// A half-open probe must be an acquired request. Do not return a
+		// wait plan that could pin the account without producing a probe result.
+		return nil, nil
 	}
 
 	cfg := s.schedulingConfig()

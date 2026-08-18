@@ -225,6 +225,8 @@ func TestSettingHandler_UpdateSettings_PersistsPaymentVisibleMethodsAndAdvancedS
 		"openai_advanced_scheduler_enabled":                       true,
 		"openai_oauth_scheduling_rate_multiplier":                 0.05,
 		"openai_advanced_scheduler_subscription_priority_enabled": true,
+		"openai_advanced_scheduler_cache_min_rate":                 85,
+		"openai_advanced_scheduler_cache_recovery_minutes":         22,
 	}
 	rawBody, err := json.Marshal(body)
 	require.NoError(t, err)
@@ -256,6 +258,16 @@ func TestSettingHandler_UpdateSettings_PersistsPaymentVisibleMethodsAndAdvancedS
 	require.Equal(t, true, data["openai_advanced_scheduler_enabled"])
 	require.Equal(t, 0.05, data["openai_oauth_scheduling_rate_multiplier"])
 	require.Equal(t, true, data["openai_advanced_scheduler_subscription_priority_enabled"])
+	require.Equal(t, 85.0, data["openai_advanced_scheduler_cache_min_rate"])
+	require.Equal(t, 22.0, data["openai_advanced_scheduler_cache_recovery_minutes"])
+}
+
+func TestSettingHandler_AuditDiffIncludesOpenAICachePolicy(t *testing.T) {
+	before := &service.SystemSettings{OpenAIAdvancedSchedulerCacheMinRate: 80, OpenAIAdvancedSchedulerCacheRecoveryMinutes: 15}
+	after := &service.SystemSettings{OpenAIAdvancedSchedulerCacheMinRate: 85, OpenAIAdvancedSchedulerCacheRecoveryMinutes: 22}
+	changed := diffSettings(before, after, nil, nil, UpdateSettingsRequest{})
+	require.Contains(t, changed, "openai_advanced_scheduler_cache_min_rate")
+	require.Contains(t, changed, "openai_advanced_scheduler_cache_recovery_minutes")
 }
 
 func TestSettingHandler_UpdateSettings_PreservesLegacyBlankPaymentVisibleMethodSource(t *testing.T) {

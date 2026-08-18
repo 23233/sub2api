@@ -29,6 +29,14 @@ const (
 const (
 	openAIAdvancedSchedulerSettingCacheTTL  = 5 * time.Second
 	openAIAdvancedSchedulerSettingDBTimeout = 2 * time.Second
+	// A cache miss on a large request is strong evidence, while tiny requests
+	// are too noisy to change account health by themselves.
+	openAIAccountCacheMinSampleTokens int64 = 8192
+	openAIAccountCacheWindowTokens    int64 = 1_000_000
+	openAIAccountCacheProbeLease            = 2 * time.Minute
+	openAIAccountCacheMaxRecovery           = 6 * time.Hour
+	defaultOpenAIAccountCacheMinRate        = 0.80
+	defaultOpenAIAccountCacheRecovery       = 15 * time.Minute
 	// ponytail: cap probes added when cost ordering expands configured Top-K;
 	// use bulk acquisition if a measured workload needs a higher ceiling.
 	openAIAccountSelectionProbeLimit = 64
@@ -48,6 +56,8 @@ type cachedOpenAIAdvancedSchedulerSetting struct {
 	enabled                        bool
 	stickyWeightedEnabled          bool
 	subscriptionPriorityEnabled    bool
+	cacheMinRate                   float64
+	cacheRecoveryMinutes           int
 	lbTopKOverride                 int
 	weightOverrides                map[string]float64
 	expiresAt                      int64
@@ -59,6 +69,8 @@ type openAIAdvancedSchedulerRuntimeSettings struct {
 	enabled                        bool
 	stickyWeightedEnabled          bool
 	subscriptionPriorityEnabled    bool
+	cacheMinRate                   float64
+	cacheRecoveryMinutes           int
 	lbTopKOverride                 int
 	weightOverrides                map[string]float64
 }
@@ -86,6 +98,35 @@ type OpenAIAccountScheduleRequest struct {
 	// and compact_model_mapping; native remote compaction v2 leaves it false.
 	RequireCompact bool
 	ExcludedIDs    map[int64]struct{}
+}
+
+// OpenAIAccountScheduleUsage is the upstream usage signal used by the
+// cache-aware scheduler. InputTokens is the uncached input bucket; cache
+// buckets are mutually exclusive with it.
+type OpenAIAccountScheduleUsage struct {
+	InputTokens         int
+	CacheCreationTokens int
+	CacheReadTokens     int
+	AccountCost         float64
+}
+
+type openAIAccountCacheState string
+
+const (
+	openAIAccountCacheUnknown  openAIAccountCacheState = "unknown"
+	openAIAccountCacheHealthy  openAIAccountCacheState = "healthy"
+	openAIAccountCacheBlocked  openAIAccountCacheState = "blocked"
+	openAIAccountCacheHalfOpen openAIAccountCacheState = "half_open"
+	openAIAccountCacheProbing  openAIAccountCacheState = "probing"
+)
+
+type openAIAccountCacheDecision struct {
+	state           openAIAccountCacheState
+	cacheRate       float64
+	sampleTokens    int64
+	observedCost    float64
+	hasObservedCost bool
+	probe           bool
 }
 
 type OpenAIAccountScheduleDecision struct {
@@ -181,11 +222,33 @@ func (m *openAIAccountSchedulerMetrics) recordSwitch() {
 type openAIAccountRuntimeStats struct {
 	accounts     sync.Map
 	accountCount atomic.Int64
+	modelStats   sync.Map // openAIAccountModelRuntimeKey -> *openAIAccountModelRuntimeStat
 }
 
 type openAIAccountRuntimeStat struct {
 	errorRateEWMABits atomic.Uint64
 	ttftEWMABits      atomic.Uint64
+}
+
+type openAIAccountModelRuntimeKey struct {
+	accountID int64
+	model     string
+}
+
+type openAIAccountModelRuntimeStat struct {
+	mu                  sync.Mutex
+	inputTokens         int64
+	cacheCreationTokens int64
+	cacheReadTokens     int64
+	cost                float64
+	blockedUntil        time.Time
+	probeLeaseUntil     time.Time
+	probeInFlight       bool
+	failureCount        int
+	ttft                float64
+	ttftDeviation       float64
+	hasTTFT             bool
+	errorRate           float64
 }
 
 func newOpenAIAccountRuntimeStats() *openAIAccountRuntimeStats {
@@ -276,6 +339,366 @@ func (s *openAIAccountRuntimeStats) snapshot(accountID int64) (errorRate float64
 		return errorRate, 0, false
 	}
 	return errorRate, ttftValue, true
+}
+
+func normalizeOpenAIAccountScheduleModel(model string) string {
+	return strings.ToLower(strings.TrimSpace(model))
+}
+
+func (s *openAIAccountRuntimeStats) loadOrCreateModel(accountID int64, model string) *openAIAccountModelRuntimeStat {
+	if s == nil || accountID <= 0 {
+		return nil
+	}
+	model = normalizeOpenAIAccountScheduleModel(model)
+	if model == "" {
+		return nil
+	}
+	key := openAIAccountModelRuntimeKey{accountID: accountID, model: model}
+	if value, ok := s.modelStats.Load(key); ok {
+		stat, _ := value.(*openAIAccountModelRuntimeStat)
+		return stat
+	}
+	stat := &openAIAccountModelRuntimeStat{}
+	actual, _ := s.modelStats.LoadOrStore(key, stat)
+	result, _ := actual.(*openAIAccountModelRuntimeStat)
+	if result != nil {
+		return result
+	}
+	return stat
+}
+
+func openAIAccountScheduleUsageBuckets(usage OpenAIAccountScheduleUsage) (input, cacheCreation, cacheRead int64, cost float64) {
+	input = int64(usage.InputTokens)
+	cacheCreation = int64(usage.CacheCreationTokens)
+	cacheRead = int64(usage.CacheReadTokens)
+	if input < 0 {
+		input = 0
+	}
+	if cacheCreation < 0 {
+		cacheCreation = 0
+	}
+	if cacheRead < 0 {
+		cacheRead = 0
+	}
+	cost = usage.AccountCost
+	if math.IsNaN(cost) || math.IsInf(cost, 0) || cost < 0 {
+		cost = 0
+	}
+	return input, cacheCreation, cacheRead, cost
+}
+
+func openAIAccountCacheSampleTokens(input, cacheCreation, cacheRead int64) int64 {
+	return input + cacheCreation + cacheRead
+}
+
+func cacheRateForBuckets(input, cacheCreation, cacheRead int64) float64 {
+	total := openAIAccountCacheSampleTokens(input, cacheCreation, cacheRead)
+	if total <= 0 {
+		return 0
+	}
+	return float64(cacheRead) / float64(total)
+}
+
+func normalizeOpenAIAccountCacheThreshold(value float64) float64 {
+	if math.IsNaN(value) || math.IsInf(value, 0) {
+		return defaultOpenAIAccountCacheMinRate
+	}
+	if value > 1 {
+		value /= 100
+	}
+	return clamp01(value)
+}
+
+func normalizeOpenAIAccountCacheRecovery(value time.Duration) time.Duration {
+	if value <= 0 {
+		return defaultOpenAIAccountCacheRecovery
+	}
+	if value > openAIAccountCacheMaxRecovery {
+		return openAIAccountCacheMaxRecovery
+	}
+	return value
+}
+
+func (s *openAIAccountRuntimeStats) reportUsageAt(
+	accountID int64,
+	model string,
+	usage OpenAIAccountScheduleUsage,
+	threshold float64,
+	recovery time.Duration,
+	now time.Time,
+) {
+	stat := s.loadOrCreateModel(accountID, model)
+	if stat == nil {
+		return
+	}
+	input, cacheCreation, cacheRead, cost := openAIAccountScheduleUsageBuckets(usage)
+	sampleTokens := openAIAccountCacheSampleTokens(input, cacheCreation, cacheRead)
+	if sampleTokens <= 0 {
+		return
+	}
+	threshold = normalizeOpenAIAccountCacheThreshold(threshold)
+	recovery = normalizeOpenAIAccountCacheRecovery(recovery)
+	stat.mu.Lock()
+	defer stat.mu.Unlock()
+	if now.IsZero() {
+		now = time.Now()
+	}
+
+	if stat.probeInFlight {
+		// A probe without enough prompt tokens is inconclusive. Keep the
+		// existing evidence and wait another base interval for a meaningful
+		// probe instead of replacing the sample window with a tiny request.
+		if sampleTokens < openAIAccountCacheMinSampleTokens {
+			stat.probeInFlight = false
+			stat.probeLeaseUntil = time.Time{}
+			stat.blockedUntil = now.Add(recovery)
+			return
+		}
+		stat.inputTokens = input
+		stat.cacheCreationTokens = cacheCreation
+		stat.cacheReadTokens = cacheRead
+		stat.cost = cost
+		stat.probeInFlight = false
+		stat.probeLeaseUntil = time.Time{}
+		if sampleTokens >= openAIAccountCacheMinSampleTokens && cacheRateForBuckets(input, cacheCreation, cacheRead) >= threshold {
+			stat.blockedUntil = time.Time{}
+			stat.failureCount = 0
+			return
+		}
+		stat.blockLocked(now, recovery)
+		return
+	}
+
+	stat.addSampleLocked(input, cacheCreation, cacheRead, cost)
+	if threshold > 0 && stat.sampleTokensLocked() >= openAIAccountCacheMinSampleTokens && stat.cacheRateLocked() < threshold {
+		if stat.blockedUntil.IsZero() || !now.Before(stat.blockedUntil) {
+			stat.blockLocked(now, recovery)
+		}
+	}
+}
+
+func (s *openAIAccountRuntimeStats) reportUsage(accountID int64, model string, usage OpenAIAccountScheduleUsage, threshold float64, recovery time.Duration) {
+	s.reportUsageAt(accountID, model, usage, threshold, recovery, time.Now())
+}
+
+func (stat *openAIAccountModelRuntimeStat) addSampleLocked(input, cacheCreation, cacheRead int64, cost float64) {
+	sampleTokens := openAIAccountCacheSampleTokens(input, cacheCreation, cacheRead)
+	if sampleTokens >= openAIAccountCacheWindowTokens {
+		stat.inputTokens = input
+		stat.cacheCreationTokens = cacheCreation
+		stat.cacheReadTokens = cacheRead
+		stat.cost = cost
+		return
+	}
+	currentTokens := stat.sampleTokensLocked()
+	if currentTokens+sampleTokens > openAIAccountCacheWindowTokens && currentTokens > 0 {
+		keep := float64(openAIAccountCacheWindowTokens-sampleTokens) / float64(currentTokens)
+		stat.inputTokens = int64(float64(stat.inputTokens) * keep)
+		stat.cacheCreationTokens = int64(float64(stat.cacheCreationTokens) * keep)
+		stat.cacheReadTokens = int64(float64(stat.cacheReadTokens) * keep)
+		stat.cost *= keep
+	}
+	stat.inputTokens += input
+	stat.cacheCreationTokens += cacheCreation
+	stat.cacheReadTokens += cacheRead
+	stat.cost += cost
+}
+
+func (stat *openAIAccountModelRuntimeStat) sampleTokensLocked() int64 {
+	return openAIAccountCacheSampleTokens(stat.inputTokens, stat.cacheCreationTokens, stat.cacheReadTokens)
+}
+
+func (stat *openAIAccountModelRuntimeStat) cacheRateLocked() float64 {
+	total := stat.sampleTokensLocked()
+	if total <= 0 {
+		return 0
+	}
+	return float64(stat.cacheReadTokens) / float64(total)
+}
+
+func (stat *openAIAccountModelRuntimeStat) observedCostLocked() (float64, bool) {
+	total := stat.sampleTokensLocked()
+	if total <= 0 || stat.cost <= 0 {
+		return 0, false
+	}
+	return stat.cost / float64(total), true
+}
+
+func (stat *openAIAccountModelRuntimeStat) blockLocked(now time.Time, recovery time.Duration) {
+	stat.failureCount++
+	if stat.failureCount < 1 {
+		stat.failureCount = 1
+	}
+	multiplier := math.Pow(2, float64(stat.failureCount-1))
+	duration := time.Duration(float64(recovery) * multiplier)
+	if duration > openAIAccountCacheMaxRecovery || duration <= 0 {
+		duration = openAIAccountCacheMaxRecovery
+	}
+	stat.blockedUntil = now.Add(duration)
+	stat.probeInFlight = false
+	stat.probeLeaseUntil = time.Time{}
+}
+
+func (s *openAIAccountRuntimeStats) cacheDecisionAt(accountID int64, model string, threshold float64, now time.Time) openAIAccountCacheDecision {
+	return s.cacheDecisionAtWithRecovery(accountID, model, threshold, defaultOpenAIAccountCacheRecovery, now)
+}
+
+func (s *openAIAccountRuntimeStats) cacheDecisionAtWithRecovery(accountID int64, model string, threshold float64, recovery time.Duration, now time.Time) openAIAccountCacheDecision {
+	stat := s.loadOrCreateModel(accountID, model)
+	if stat == nil {
+		return openAIAccountCacheDecision{state: openAIAccountCacheUnknown}
+	}
+	threshold = normalizeOpenAIAccountCacheThreshold(threshold)
+	recovery = normalizeOpenAIAccountCacheRecovery(recovery)
+	if now.IsZero() {
+		now = time.Now()
+	}
+	stat.mu.Lock()
+	defer stat.mu.Unlock()
+	if stat.probeInFlight && !now.Before(stat.probeLeaseUntil) {
+		stat.blockLocked(now, recovery)
+	}
+	decision := stat.cacheDecisionLocked(threshold, now)
+	if decision.state == openAIAccountCacheHealthy && stat.blockedUntil.IsZero() == false {
+		stat.blockedUntil = time.Time{}
+		stat.failureCount = 0
+	}
+	return decision
+}
+
+func (stat *openAIAccountModelRuntimeStat) cacheDecisionLocked(threshold float64, now time.Time) openAIAccountCacheDecision {
+	decision := openAIAccountCacheDecision{
+		state:        openAIAccountCacheUnknown,
+		cacheRate:    stat.cacheRateLocked(),
+		sampleTokens: stat.sampleTokensLocked(),
+	}
+	decision.observedCost, decision.hasObservedCost = stat.observedCostLocked()
+	if threshold <= 0 {
+		decision.state = openAIAccountCacheHealthy
+		return decision
+	}
+	if stat.probeInFlight {
+		decision.state = openAIAccountCacheProbing
+		decision.probe = true
+		return decision
+	}
+	if decision.sampleTokens < openAIAccountCacheMinSampleTokens {
+		return decision
+	}
+	if !stat.blockedUntil.IsZero() {
+		if now.Before(stat.blockedUntil) {
+			decision.state = openAIAccountCacheBlocked
+			return decision
+		}
+		decision.state = openAIAccountCacheHalfOpen
+		return decision
+	}
+	if decision.cacheRate >= threshold {
+		decision.state = openAIAccountCacheHealthy
+		return decision
+	}
+	decision.state = openAIAccountCacheHalfOpen
+	return decision
+}
+
+func (s *openAIAccountRuntimeStats) beginCacheProbeAt(accountID int64, model string, now time.Time) bool {
+	return s.beginCacheProbeAtWithPolicy(accountID, model, defaultOpenAIAccountCacheMinRate, defaultOpenAIAccountCacheRecovery, now)
+}
+
+func (s *openAIAccountRuntimeStats) beginCacheProbeAtWithPolicy(accountID int64, model string, threshold float64, recovery time.Duration, now time.Time) bool {
+	stat := s.loadOrCreateModel(accountID, model)
+	if stat == nil {
+		return false
+	}
+	if now.IsZero() {
+		now = time.Now()
+	}
+	threshold = normalizeOpenAIAccountCacheThreshold(threshold)
+	recovery = normalizeOpenAIAccountCacheRecovery(recovery)
+	stat.mu.Lock()
+	defer stat.mu.Unlock()
+	if stat.probeInFlight {
+		if now.Before(stat.probeLeaseUntil) {
+			return false
+		}
+		stat.blockLocked(now, recovery)
+	}
+	decision := stat.cacheDecisionLocked(threshold, now)
+	if decision.state != openAIAccountCacheHalfOpen {
+		return false
+	}
+	stat.probeInFlight = true
+	stat.probeLeaseUntil = now.Add(openAIAccountCacheProbeLease)
+	return true
+}
+
+func (s *openAIAccountRuntimeStats) cancelCacheProbe(accountID int64, model string) {
+	stat := s.loadOrCreateModel(accountID, model)
+	if stat == nil {
+		return
+	}
+	stat.mu.Lock()
+	stat.probeInFlight = false
+	stat.probeLeaseUntil = time.Time{}
+	stat.mu.Unlock()
+}
+
+func (s *openAIAccountRuntimeStats) reportModelResultAt(accountID int64, model string, success bool, firstTokenMs *int, threshold float64, recovery time.Duration, now time.Time) {
+	stat := s.loadOrCreateModel(accountID, model)
+	if stat == nil {
+		return
+	}
+	if now.IsZero() {
+		now = time.Now()
+	}
+	recovery = normalizeOpenAIAccountCacheRecovery(recovery)
+	stat.mu.Lock()
+	defer stat.mu.Unlock()
+	if success {
+		stat.errorRate *= 0.8
+	} else {
+		stat.errorRate = 0.2 + stat.errorRate*0.8
+		if stat.probeInFlight {
+			stat.blockLocked(now, recovery)
+		}
+	}
+	if firstTokenMs != nil && *firstTokenMs > 0 {
+		value := float64(*firstTokenMs)
+		if !stat.hasTTFT {
+			stat.ttft = value
+			stat.ttftDeviation = 0
+			stat.hasTTFT = true
+		} else {
+			deviation := math.Abs(value - stat.ttft)
+			stat.ttftDeviation = 0.2*deviation + 0.8*stat.ttftDeviation
+			stat.ttft = 0.2*value + 0.8*stat.ttft
+		}
+	}
+	_ = threshold // threshold is reserved for future probe result policies.
+}
+
+func (s *openAIAccountRuntimeStats) modelSnapshot(accountID int64, model string) (cache openAIAccountCacheDecision, errorRate, ttft float64, hasTTFT bool) {
+	return s.modelSnapshotWithPolicy(accountID, model, defaultOpenAIAccountCacheMinRate, defaultOpenAIAccountCacheRecovery, time.Now())
+}
+
+func (s *openAIAccountRuntimeStats) modelSnapshotWithPolicy(accountID int64, model string, threshold float64, recovery time.Duration, now time.Time) (cache openAIAccountCacheDecision, errorRate, ttft float64, hasTTFT bool) {
+	stat := s.loadOrCreateModel(accountID, model)
+	if stat == nil {
+		return openAIAccountCacheDecision{state: openAIAccountCacheUnknown}, 0, 0, false
+	}
+	stat.mu.Lock()
+	defer stat.mu.Unlock()
+	if now.IsZero() {
+		now = time.Now()
+	}
+	threshold = normalizeOpenAIAccountCacheThreshold(threshold)
+	recovery = normalizeOpenAIAccountCacheRecovery(recovery)
+	if stat.probeInFlight && !now.Before(stat.probeLeaseUntil) {
+		stat.blockLocked(now, recovery)
+	}
+	cache = stat.cacheDecisionLocked(threshold, now)
+	errorRate = clamp01(stat.errorRate)
+	return cache, errorRate, stat.ttft + 0.5*stat.ttftDeviation, stat.hasTTFT
 }
 
 func (s *openAIAccountRuntimeStats) size() int {
@@ -519,8 +942,22 @@ func (s *defaultOpenAIAccountScheduler) selectBySessionHash(
 		_ = s.service.deleteStickySessionAccountID(ctx, req.GroupID, sessionHash)
 		return nil, false, nil
 	}
+	cacheModel, cacheProbeReserved, cacheAllowed := s.beginCacheProbeForAccount(ctx, account, req)
+	if !cacheAllowed {
+		// Keep the binding intact. A blocked/probing account is a transient
+		// cache-quality state; normal scheduling may choose another account and
+		// the binding can be reused after recovery.
+		return nil, false, nil
+	}
+	cancelCacheProbe := func() {
+		if cacheProbeReserved {
+			s.cancelCacheProbeForAccount(account.ID, cacheModel)
+			cacheProbeReserved = false
+		}
+	}
 	escapeCfg := s.service.openAIStickyEscapeConfig()
 	if reason, errorRate, ttft, shouldEscape := s.shouldEscapeStickyAccount(accountID, escapeCfg); shouldEscape {
+		cancelCacheProbe()
 		slog.Info("sticky_escape_triggered",
 			"account_id", accountID,
 			"reason", reason,
@@ -537,6 +974,15 @@ func (s *defaultOpenAIAccountScheduler) selectBySessionHash(
 			Acquired:    true,
 			ReleaseFunc: result.ReleaseFunc,
 		}), false, nil
+	}
+	if cacheProbeReserved {
+		cancelCacheProbe()
+		if acquireErr != nil {
+			return nil, false, acquireErr
+		}
+		// A half-open probe must be a real acquired request. Never turn a
+		// failed probe acquisition into a wait plan on the same account.
+		return nil, false, nil
 	}
 
 	cfg := s.service.schedulingConfig()
@@ -607,14 +1053,113 @@ func (s *defaultOpenAIAccountScheduler) shouldEscapeStickyAccount(accountID int6
 }
 
 type openAIAccountCandidateScore struct {
-	account   *Account
-	loadInfo  *AccountLoadInfo
-	loadKnown bool
-	score     float64
-	priority  int
-	errorRate float64
-	ttft      float64
-	hasTTFT   bool
+	account    *Account
+	loadInfo   *AccountLoadInfo
+	loadKnown  bool
+	score      float64
+	priority   int
+	errorRate  float64
+	ttft       float64
+	hasTTFT    bool
+	cache      openAIAccountCacheDecision
+	cacheAware bool
+	cacheModel string
+}
+
+func (s *defaultOpenAIAccountScheduler) cachePolicyForRequest(ctx context.Context, req OpenAIAccountScheduleRequest) (float64, time.Duration, bool) {
+	if s == nil || s.service == nil || NormalizeOpenAICompatiblePlatform(req.Platform) != PlatformOpenAI || s.stats == nil {
+		return 0, 0, false
+	}
+	if req.RequiredImageCapability != "" ||
+		OpenAIImagesEndpointFromContext(ctx) ||
+		OpenAIImageGenerationIntentFromContext(ctx) {
+		return 0, 0, false
+	}
+	switch req.RequiredCapability {
+	case "", OpenAIEndpointCapabilityChatCompletions, OpenAIEndpointCapabilityResponses:
+		// Prompt caching is meaningful for chat/responses token requests.
+	default:
+		return 0, 0, false
+	}
+	threshold := s.service.openAIAdvancedSchedulerCacheMinRate(ctx)
+	if threshold <= 0 {
+		return 0, 0, false
+	}
+	return threshold, s.service.openAIAdvancedSchedulerCacheRecoveryInterval(ctx), true
+}
+
+func (s *defaultOpenAIAccountScheduler) cacheDecisionForAccount(ctx context.Context, account *Account, req OpenAIAccountScheduleRequest) (openAIAccountCacheDecision, string, bool) {
+	threshold, recovery, enabled := s.cachePolicyForRequest(ctx, req)
+	if !enabled || account == nil {
+		return openAIAccountCacheDecision{state: openAIAccountCacheHealthy}, "", false
+	}
+	model := canonicalOpenAIAccountSchedulingModel(account, req.RequestedModel)
+	decision, _, _, _ := s.stats.modelSnapshotWithPolicy(account.ID, model, threshold, recovery, time.Now())
+	return decision, model, true
+}
+
+// beginCacheProbeForAccount applies the cache circuit to sticky paths as well
+// as the normal load-balanced path. A half-open account is only eligible when
+// this call can reserve its single probe lease; callers must cancel the lease
+// when no real request was acquired.
+func (s *defaultOpenAIAccountScheduler) beginCacheProbeForAccount(
+	ctx context.Context,
+	account *Account,
+	req OpenAIAccountScheduleRequest,
+) (model string, reserved bool, allowed bool) {
+	decision, model, cacheAware := s.cacheDecisionForAccount(ctx, account, req)
+	if !cacheAware {
+		return model, false, true
+	}
+	switch decision.state {
+	case openAIAccountCacheBlocked, openAIAccountCacheProbing:
+		return model, false, false
+	case openAIAccountCacheHalfOpen:
+		threshold, recovery, _ := s.cachePolicyForRequest(ctx, req)
+		if !s.stats.beginCacheProbeAtWithPolicy(account.ID, model, threshold, recovery, time.Now()) {
+			return model, false, false
+		}
+		return model, true, true
+	default:
+		return model, false, true
+	}
+}
+
+func (s *defaultOpenAIAccountScheduler) cancelCacheProbeForAccount(accountID int64, model string) {
+	if s == nil || s.stats == nil || accountID <= 0 || strings.TrimSpace(model) == "" {
+		return
+	}
+	s.stats.cancelCacheProbe(accountID, model)
+}
+
+func (s *OpenAIGatewayService) beginOpenAICacheProbe(
+	ctx context.Context,
+	account *Account,
+	requestedModel string,
+) (model string, reserved bool, allowed bool) {
+	if s == nil {
+		return "", false, true
+	}
+	scheduler := s.getOpenAIAccountScheduler(ctx)
+	advanced, ok := scheduler.(*defaultOpenAIAccountScheduler)
+	if !ok || advanced == nil {
+		return "", false, true
+	}
+	return advanced.beginCacheProbeForAccount(ctx, account, OpenAIAccountScheduleRequest{
+		Platform:       PlatformOpenAI,
+		RequestedModel: requestedModel,
+	})
+}
+
+func (s *OpenAIGatewayService) cancelOpenAICacheProbe(accountID int64, model string) {
+	if s == nil {
+		return
+	}
+	advanced, ok := s.openaiScheduler.(*defaultOpenAIAccountScheduler)
+	if !ok || advanced == nil {
+		return
+	}
+	advanced.cancelCacheProbeForAccount(accountID, model)
 }
 
 type openAIAccountCandidateHeap []openAIAccountCandidateScore
@@ -649,6 +1194,9 @@ func (h *openAIAccountCandidateHeap) Pop() any {
 }
 
 func isOpenAIAccountCandidateBetter(left openAIAccountCandidateScore, right openAIAccountCandidateScore) bool {
+	if better, decided := compareOpenAICacheAwareQuality(left, right); decided {
+		return better
+	}
 	if left.score != right.score {
 		return left.score > right.score
 	}
@@ -662,6 +1210,50 @@ func isOpenAIAccountCandidateBetter(left openAIAccountCandidateScore, right open
 		return left.loadInfo.WaitingCount < right.loadInfo.WaitingCount
 	}
 	return left.account.ID < right.account.ID
+}
+
+func compareOpenAICacheAwareQuality(left, right openAIAccountCandidateScore) (better bool, decided bool) {
+	if !left.cacheAware || !right.cacheAware {
+		return false, false
+	}
+	cacheRank := func(state openAIAccountCacheState) int {
+		switch state {
+		case openAIAccountCacheHalfOpen:
+			return 0 // use one due probe to discover recovery
+		case openAIAccountCacheHealthy:
+			return 1
+		case openAIAccountCacheUnknown:
+			return 2
+		default:
+			return 3
+		}
+	}
+	leftRank, rightRank := cacheRank(left.cache.state), cacheRank(right.cache.state)
+	if leftRank != rightRank {
+		return leftRank < rightRank, true
+	}
+	if left.cache.state != openAIAccountCacheHealthy && left.cache.state != openAIAccountCacheHalfOpen {
+		return false, false
+	}
+	if left.hasTTFT && right.hasTTFT {
+		fastest := math.Min(left.ttft, right.ttft)
+		band := math.Max(250, fastest*0.20)
+		if math.Abs(left.ttft-right.ttft) > band {
+			return left.ttft < right.ttft, true
+		}
+	}
+	if left.cache.hasObservedCost && right.cache.hasObservedCost {
+		minCost := math.Min(left.cache.observedCost, right.cache.observedCost)
+		if minCost > 0 && math.Abs(left.cache.observedCost-right.cache.observedCost) > minCost*0.05 {
+			return left.cache.observedCost < right.cache.observedCost, true
+		}
+	}
+	if left.cache.sampleTokens >= openAIAccountCacheMinSampleTokens && right.cache.sampleTokens >= openAIAccountCacheMinSampleTokens {
+		if math.Abs(left.cache.cacheRate-right.cache.cacheRate) > 0.02 {
+			return left.cache.cacheRate > right.cache.cacheRate, true
+		}
+	}
+	return false, false
 }
 
 func selectTopKOpenAICandidates(candidates []openAIAccountCandidateScore, topK int) []openAIAccountCandidateScore {
@@ -826,13 +1418,33 @@ func (s *defaultOpenAIAccountScheduler) buildOpenAIAccountLoadPlan(
 		if s.stats != nil {
 			errorRate, ttft, hasTTFT = s.stats.snapshot(account.ID)
 		}
+		cacheDecision, cacheModel, cacheAware := s.cacheDecisionForAccount(ctx, account, req)
+		if cacheAware {
+			modelCache, modelErrorRate, modelTTFT, modelHasTTFT := s.stats.modelSnapshotWithPolicy(
+				account.ID,
+				cacheModel,
+				s.service.openAIAdvancedSchedulerCacheMinRate(ctx),
+				s.service.openAIAdvancedSchedulerCacheRecoveryInterval(ctx),
+				time.Now(),
+			)
+			cacheDecision = modelCache
+			if modelHasTTFT {
+				ttft, hasTTFT = modelTTFT, true
+			}
+			if modelHasTTFT || modelErrorRate > 0 {
+				errorRate = modelErrorRate
+			}
+		}
 		allCandidates = append(allCandidates, openAIAccountCandidateScore{
-			account:   account,
-			loadInfo:  loadInfo,
-			loadKnown: loadKnown,
-			errorRate: errorRate,
-			ttft:      ttft,
-			hasTTFT:   hasTTFT,
+			account:    account,
+			loadInfo:   loadInfo,
+			loadKnown:  loadKnown,
+			errorRate:  errorRate,
+			ttft:       ttft,
+			hasTTFT:    hasTTFT,
+			cache:      cacheDecision,
+			cacheAware: cacheAware,
+			cacheModel: cacheModel,
 		})
 	}
 
@@ -1017,6 +1629,39 @@ func (s *defaultOpenAIAccountScheduler) buildOpenAISelectionOrder(
 			groupTopK = len(pool)
 		}
 		ranked := selectTopKOpenAICandidates(pool, groupTopK)
+		if hasOpenAICacheAwareCandidate(ranked) {
+			ordered := append([]openAIAccountCandidateScore(nil), pool...)
+			sort.SliceStable(ordered, func(i, j int) bool {
+				return isOpenAIAccountCandidateBetter(ordered[i], ordered[j])
+			})
+			if len(ordered) <= 1 {
+				return ordered
+			}
+			primary := make([]openAIAccountCandidateScore, 0, len(ordered))
+			best := ordered[0]
+			for _, candidate := range ordered {
+				if openAICacheQualityEquivalent(best, candidate) {
+					primary = append(primary, candidate)
+				}
+			}
+			if len(primary) == 0 {
+				primary = []openAIAccountCandidateScore{best}
+			}
+			if len(primary) < len(ordered) {
+				selected := make(map[int64]struct{}, len(primary))
+				for _, candidate := range primary {
+					selected[candidate.account.ID] = struct{}{}
+				}
+				rest := make([]openAIAccountCandidateScore, 0, len(ordered)-len(primary))
+				for _, candidate := range ordered {
+					if _, ok := selected[candidate.account.ID]; !ok {
+						rest = append(rest, candidate)
+					}
+				}
+				return append(buildOpenAIWeightedSelectionOrder(primary, req), rest...)
+			}
+			return buildOpenAIWeightedSelectionOrder(primary, req)
+		}
 		var primary []openAIAccountCandidateScore
 		if req.StickyWeighted {
 			for _, stickyID := range []int64{req.StickyPreviousAccountID, req.StickyAccountID} {
@@ -1081,6 +1726,39 @@ func (s *defaultOpenAIAccountScheduler) buildOpenAISelectionOrder(
 	return buildSelectionOrder(plan.candidates)
 }
 
+func hasOpenAICacheAwareCandidate(candidates []openAIAccountCandidateScore) bool {
+	for _, candidate := range candidates {
+		if candidate.cacheAware {
+			return true
+		}
+	}
+	return false
+}
+
+func openAICacheQualityEquivalent(left, right openAIAccountCandidateScore) bool {
+	if !left.cacheAware || !right.cacheAware || left.cache.state != right.cache.state {
+		return false
+	}
+	if left.hasTTFT && right.hasTTFT {
+		fastest := math.Min(left.ttft, right.ttft)
+		band := math.Max(250, fastest*0.20)
+		if math.Abs(left.ttft-right.ttft) > band {
+			return false
+		}
+	}
+	if left.cache.hasObservedCost && right.cache.hasObservedCost {
+		minCost := math.Min(left.cache.observedCost, right.cache.observedCost)
+		if minCost > 0 && math.Abs(left.cache.observedCost-right.cache.observedCost) > minCost*0.05 {
+			return false
+		}
+	}
+	if left.cache.sampleTokens >= openAIAccountCacheMinSampleTokens && right.cache.sampleTokens >= openAIAccountCacheMinSampleTokens &&
+		math.Abs(left.cache.cacheRate-right.cache.cacheRate) > 0.02 {
+		return false
+	}
+	return true
+}
+
 func sortOpenAICompactRetryCandidates(pool []openAIAccountCandidateScore) []openAIAccountCandidateScore {
 	if len(pool) == 0 {
 		return nil
@@ -1142,34 +1820,56 @@ func (s *defaultOpenAIAccountScheduler) tryAcquireOpenAISelectionOrderWithBudget
 			candidate.loadInfo.CurrentConcurrency >= candidate.account.Concurrency {
 			continue
 		}
+		probeReserved := false
+		if candidate.cacheAware && candidate.cache.state == openAIAccountCacheHalfOpen {
+			threshold := s.service.openAIAdvancedSchedulerCacheMinRate(ctx)
+			recovery := s.service.openAIAdvancedSchedulerCacheRecoveryInterval(ctx)
+			if !s.stats.beginCacheProbeAtWithPolicy(candidate.account.ID, candidate.cacheModel, threshold, recovery, time.Now()) {
+				continue
+			}
+			probeReserved = true
+		}
+		cancelProbe := func() {
+			if probeReserved {
+				s.stats.cancelCacheProbe(candidate.account.ID, candidate.cacheModel)
+				probeReserved = false
+			}
+		}
 
 		result, attempted, acquireErr := s.tryAcquireOpenAIAccountSlot(ctx, candidate.account.ID, candidate.account.Concurrency, budget)
 		if !attempted {
+			cancelProbe()
 			break
 		}
 		if acquireErr != nil {
+			cancelProbe()
 			return nil, compactBlocked, acquireErr
 		}
 		if result == nil || !result.Acquired {
+			cancelProbe()
 			continue
 		}
 
 		fresh := s.service.resolveFreshSchedulableOpenAIAccount(ctx, candidate.account, req.Platform, req.RequestedModel, false, req.RequiredCapability)
 		if fresh == nil || !s.isAccountTransportCompatible(fresh, req.RequiredTransport) || !s.isAccountRequestCompatible(ctx, fresh, req) {
+			cancelProbe()
 			release(result)
 			continue
 		}
 		if !s.consumeOpenAISelectionDBRecheck(budget) {
+			cancelProbe()
 			release(result)
 			break
 		}
 		fresh = s.service.recheckSelectedOpenAIAccountFromDB(ctx, fresh, req.GroupID, req.Platform, req.RequestedModel, false, req.RequiredCapability)
 		if fresh == nil || !s.isAccountTransportCompatible(fresh, req.RequiredTransport) || !s.isAccountRequestCompatible(ctx, fresh, req) {
+			cancelProbe()
 			release(result)
 			continue
 		}
 		if req.RequireCompact && openAICompactSupportTier(fresh) == 0 {
 			compactBlocked = true
+			cancelProbe()
 			release(result)
 			continue
 		}
@@ -1178,12 +1878,15 @@ func (s *defaultOpenAIAccountScheduler) tryAcquireOpenAISelectionOrderWithBudget
 			release(result)
 			result, attempted, acquireErr = s.tryAcquireOpenAIAccountSlot(ctx, fresh.ID, fresh.Concurrency, budget)
 			if !attempted {
+				cancelProbe()
 				continue
 			}
 			if acquireErr != nil {
+				cancelProbe()
 				return nil, compactBlocked, acquireErr
 			}
 			if result == nil || !result.Acquired {
+				cancelProbe()
 				continue
 			}
 		}
@@ -1273,8 +1976,15 @@ func (s *defaultOpenAIAccountScheduler) tryFallbackToWeightedSticky(
 			isGrokModelQuotaBlocked(account.ID, upstreamModel, now) {
 			continue
 		}
+		cacheModel, cacheProbeReserved, cacheAllowed := s.beginCacheProbeForAccount(ctx, account, req)
+		if !cacheAllowed {
+			continue
+		}
 		result, acquireErr := s.service.tryAcquireAccountSlot(ctx, account.ID, account.Concurrency)
 		if acquireErr != nil {
+			if cacheProbeReserved {
+				s.cancelCacheProbeForAccount(account.ID, cacheModel)
+			}
 			return nil, acquireErr
 		}
 		if result != nil && result.Acquired {
@@ -1286,6 +1996,10 @@ func (s *defaultOpenAIAccountScheduler) tryFallbackToWeightedSticky(
 				Acquired:    true,
 				ReleaseFunc: result.ReleaseFunc,
 			}), nil
+		}
+		if cacheProbeReserved {
+			s.cancelCacheProbeForAccount(account.ID, cacheModel)
+			continue
 		}
 		if s.service.concurrencyService != nil {
 			cfg := s.service.schedulingConfig()
@@ -1413,6 +2127,12 @@ func (s *defaultOpenAIAccountScheduler) selectByLoadBalance(
 		if s.service.isOpenAIAccountRequestRuntimeBlocked(account, req.RequestedModel) {
 			filterStats.exclude("runtime_blocked")
 			continue
+		}
+		if decision, _, cacheAware := s.cacheDecisionForAccount(ctx, account, req); cacheAware {
+			if decision.state == openAIAccountCacheBlocked || decision.state == openAIAccountCacheProbing {
+				filterStats.exclude("cache_rate_below_threshold")
+				continue
+			}
 		}
 		// require_privacy_set: 跳过 privacy 未设置的账号并标记异常
 		if schedGroup != nil && schedGroup.RequirePrivacySet && !account.IsPrivacySet() {
@@ -1654,6 +2374,11 @@ func (s *defaultOpenAIAccountScheduler) finishLoadBalanceSelectionFallback(
 			if candidate.account == nil {
 				continue
 			}
+			// A half-open cache circuit must use a real acquired request as its
+			// single probe; do not hold the probe lease while waiting in a queue.
+			if candidate.cacheAware && candidate.cache.state == openAIAccountCacheHalfOpen {
+				continue
+			}
 			if budget != nil && budget.limited {
 				knownFull := candidate.loadKnown && candidate.account.Concurrency > 0 &&
 					candidate.loadInfo.CurrentConcurrency >= candidate.account.Concurrency
@@ -1733,6 +2458,12 @@ func (s *defaultOpenAIAccountScheduler) isAccountRequestCompatibleReason(ctx con
 	if s != nil && s.service != nil && s.service.isOpenAIAccountRequestRuntimeBlocked(account, req.RequestedModel) {
 		return false, "runtime_blocked"
 	}
+	if decision, _, cacheAware := s.cacheDecisionForAccount(ctx, account, req); cacheAware {
+		switch decision.state {
+		case openAIAccountCacheBlocked, openAIAccountCacheProbing:
+			return false, "cache_rate_below_threshold"
+		}
+	}
 	if s != nil && s.service != nil && s.service.isOpenAIProxyStreamQuarantined(ctx, account) {
 		return false, "proxy_stream_quarantined"
 	}
@@ -1779,6 +2510,33 @@ func (s *defaultOpenAIAccountScheduler) ReportResult(accountID int64, success bo
 		return
 	}
 	s.stats.report(accountID, success, firstTokenMs)
+}
+
+func (s *defaultOpenAIAccountScheduler) ReportModelResult(accountID int64, model string, success bool, firstTokenMs *int) {
+	if s == nil || s.stats == nil {
+		return
+	}
+	s.stats.report(accountID, success, firstTokenMs)
+	threshold := defaultOpenAIAccountCacheMinRate
+	recovery := defaultOpenAIAccountCacheRecovery
+	if s.service != nil {
+		threshold = s.service.openAIAdvancedSchedulerCacheMinRate(context.Background())
+		recovery = s.service.openAIAdvancedSchedulerCacheRecoveryInterval(context.Background())
+	}
+	s.stats.reportModelResultAt(accountID, model, success, firstTokenMs, threshold, recovery, time.Now())
+}
+
+func (s *defaultOpenAIAccountScheduler) ReportUsage(accountID int64, model string, usage OpenAIAccountScheduleUsage) {
+	if s == nil || s.stats == nil {
+		return
+	}
+	threshold := defaultOpenAIAccountCacheMinRate
+	recovery := defaultOpenAIAccountCacheRecovery
+	if s.service != nil {
+		threshold = s.service.openAIAdvancedSchedulerCacheMinRate(context.Background())
+		recovery = s.service.openAIAdvancedSchedulerCacheRecoveryInterval(context.Background())
+	}
+	s.stats.reportUsage(accountID, model, usage, threshold, recovery)
 }
 
 func (s *defaultOpenAIAccountScheduler) ReportSwitch() {
@@ -1834,6 +2592,8 @@ func (s *OpenAIGatewayService) openAIAdvancedSchedulerRuntimeSettings(ctx contex
 				enabled:                        cached.enabled,
 				stickyWeightedEnabled:          cached.stickyWeightedEnabled,
 				subscriptionPriorityEnabled:    cached.subscriptionPriorityEnabled,
+				cacheMinRate:                   cached.cacheMinRate,
+				cacheRecoveryMinutes:           cached.cacheRecoveryMinutes,
 				lbTopKOverride:                 cached.lbTopKOverride,
 				weightOverrides:                cloneOpenAIAdvancedSchedulerWeightOverrides(cached.weightOverrides),
 			}
@@ -1849,6 +2609,8 @@ func (s *OpenAIGatewayService) openAIAdvancedSchedulerRuntimeSettings(ctx contex
 					enabled:                        cached.enabled,
 					stickyWeightedEnabled:          cached.stickyWeightedEnabled,
 					subscriptionPriorityEnabled:    cached.subscriptionPriorityEnabled,
+					cacheMinRate:                   cached.cacheMinRate,
+					cacheRecoveryMinutes:           cached.cacheRecoveryMinutes,
 					lbTopKOverride:                 cached.lbTopKOverride,
 					weightOverrides:                cloneOpenAIAdvancedSchedulerWeightOverrides(cached.weightOverrides),
 				}, nil
@@ -1860,6 +2622,8 @@ func (s *OpenAIGatewayService) openAIAdvancedSchedulerRuntimeSettings(ctx contex
 		enabled := false
 		stickyWeightedEnabled := false
 		subscriptionPriorityEnabled := false
+		cacheMinRate := defaultOpenAIAccountCacheMinRate
+		cacheRecoveryMinutes := int(defaultOpenAIAccountCacheRecovery / time.Minute)
 		lbTopKOverride := 0
 		weightOverrides := map[string]float64{}
 		if repo := s.openAIAdvancedSchedulerSettingRepo(); repo != nil {
@@ -1872,6 +2636,8 @@ func (s *OpenAIGatewayService) openAIAdvancedSchedulerRuntimeSettings(ctx contex
 				enabled = strings.EqualFold(strings.TrimSpace(values[openAIAdvancedSchedulerSettingKey]), "true")
 				stickyWeightedEnabled = strings.EqualFold(strings.TrimSpace(values[SettingKeyOpenAIAdvancedSchedulerStickyWeightedEnabled]), "true")
 				subscriptionPriorityEnabled = strings.EqualFold(strings.TrimSpace(values[SettingKeyOpenAIAdvancedSchedulerSubscriptionPriorityEnabled]), "true")
+				cacheMinRate = parseOpenAIAdvancedSchedulerCacheMinRate(values[SettingKeyOpenAIAdvancedSchedulerCacheMinRate])
+				cacheRecoveryMinutes = parseOpenAIAdvancedSchedulerCacheRecoveryMinutes(values[SettingKeyOpenAIAdvancedSchedulerCacheRecoveryMinutes])
 				lbTopKOverride = parsePositiveIntOverride(values[SettingKeyOpenAIAdvancedSchedulerLBTopK])
 				weightOverrides = parseOpenAIAdvancedSchedulerWeightOverrides(values)
 			} else {
@@ -1889,6 +2655,8 @@ func (s *OpenAIGatewayService) openAIAdvancedSchedulerRuntimeSettings(ctx contex
 				enabled = strings.EqualFold(strings.TrimSpace(fallbackValues[openAIAdvancedSchedulerSettingKey]), "true")
 				stickyWeightedEnabled = strings.EqualFold(strings.TrimSpace(fallbackValues[SettingKeyOpenAIAdvancedSchedulerStickyWeightedEnabled]), "true")
 				subscriptionPriorityEnabled = strings.EqualFold(strings.TrimSpace(fallbackValues[SettingKeyOpenAIAdvancedSchedulerSubscriptionPriorityEnabled]), "true")
+				cacheMinRate = parseOpenAIAdvancedSchedulerCacheMinRate(fallbackValues[SettingKeyOpenAIAdvancedSchedulerCacheMinRate])
+				cacheRecoveryMinutes = parseOpenAIAdvancedSchedulerCacheRecoveryMinutes(fallbackValues[SettingKeyOpenAIAdvancedSchedulerCacheRecoveryMinutes])
 				lbTopKOverride = parsePositiveIntOverride(fallbackValues[SettingKeyOpenAIAdvancedSchedulerLBTopK])
 				weightOverrides = parseOpenAIAdvancedSchedulerWeightOverrides(fallbackValues)
 			}
@@ -1900,6 +2668,8 @@ func (s *OpenAIGatewayService) openAIAdvancedSchedulerRuntimeSettings(ctx contex
 			enabled:                        enabled,
 			stickyWeightedEnabled:          stickyWeightedEnabled,
 			subscriptionPriorityEnabled:    subscriptionPriorityEnabled,
+			cacheMinRate:                   cacheMinRate,
+			cacheRecoveryMinutes:           cacheRecoveryMinutes,
 			lbTopKOverride:                 lbTopKOverride,
 			weightOverrides:                cloneOpenAIAdvancedSchedulerWeightOverrides(weightOverrides),
 			expiresAt:                      time.Now().Add(openAIAdvancedSchedulerSettingCacheTTL).UnixNano(),
@@ -1910,6 +2680,8 @@ func (s *OpenAIGatewayService) openAIAdvancedSchedulerRuntimeSettings(ctx contex
 			enabled:                        enabled,
 			stickyWeightedEnabled:          stickyWeightedEnabled,
 			subscriptionPriorityEnabled:    subscriptionPriorityEnabled,
+			cacheMinRate:                   cacheMinRate,
+			cacheRecoveryMinutes:           cacheRecoveryMinutes,
 			lbTopKOverride:                 lbTopKOverride,
 			weightOverrides:                weightOverrides,
 		}, nil
@@ -1942,6 +2714,18 @@ func (s *OpenAIGatewayService) isOpenAIAdvancedSchedulerSubscriptionPriorityEnab
 	return settings.enabled && settings.subscriptionPriorityEnabled
 }
 
+func (s *OpenAIGatewayService) openAIAdvancedSchedulerCacheMinRate(ctx context.Context) float64 {
+	return normalizeOpenAIAccountCacheThreshold(s.openAIAdvancedSchedulerRuntimeSettings(ctx).cacheMinRate)
+}
+
+func (s *OpenAIGatewayService) openAIAdvancedSchedulerCacheRecoveryInterval(ctx context.Context) time.Duration {
+	minutes := s.openAIAdvancedSchedulerRuntimeSettings(ctx).cacheRecoveryMinutes
+	if minutes <= 0 {
+		return defaultOpenAIAccountCacheRecovery
+	}
+	return normalizeOpenAIAccountCacheRecovery(time.Duration(minutes) * time.Minute)
+}
+
 func openAIAdvancedSchedulerRuntimeSettingKeys() []string {
 	keys := []string{
 		SettingKeyOpenAILowUpstreamRatePriorityEnabled,
@@ -1949,12 +2733,42 @@ func openAIAdvancedSchedulerRuntimeSettingKeys() []string {
 		openAIAdvancedSchedulerSettingKey,
 		SettingKeyOpenAIAdvancedSchedulerStickyWeightedEnabled,
 		SettingKeyOpenAIAdvancedSchedulerSubscriptionPriorityEnabled,
+		SettingKeyOpenAIAdvancedSchedulerCacheMinRate,
+		SettingKeyOpenAIAdvancedSchedulerCacheRecoveryMinutes,
 		SettingKeyOpenAIAdvancedSchedulerLBTopK,
 	}
 	for _, spec := range openAIAdvancedSchedulerWeightOverrideSpecs() {
 		keys = append(keys, spec.key)
 	}
 	return keys
+}
+
+func parseOpenAIAdvancedSchedulerCacheMinRate(raw string) float64 {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return defaultOpenAIAccountCacheMinRate
+	}
+	value, err := strconv.ParseFloat(raw, 64)
+	if err != nil || math.IsNaN(value) || math.IsInf(value, 0) || value < 0 || value > 100 {
+		return defaultOpenAIAccountCacheMinRate
+	}
+	return value / 100
+}
+
+func parseOpenAIAdvancedSchedulerCacheRecoveryMinutes(raw string) int {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return int(defaultOpenAIAccountCacheRecovery / time.Minute)
+	}
+	value, err := strconv.Atoi(raw)
+	if err != nil || value <= 0 {
+		return int(defaultOpenAIAccountCacheRecovery / time.Minute)
+	}
+	maxMinutes := int(openAIAccountCacheMaxRecovery / time.Minute)
+	if value > maxMinutes {
+		return maxMinutes
+	}
+	return value
 }
 
 type openAIAdvancedSchedulerWeightOverrideSpec struct {
@@ -2307,7 +3121,28 @@ func (s *OpenAIGatewayService) ReportOpenAIAccountScheduleResult(accountID int64
 	if scheduler == nil {
 		return
 	}
+	if modelReporter, ok := scheduler.(interface {
+		ReportModelResult(int64, string, bool, *int)
+	}); ok {
+		modelReporter.ReportModelResult(accountID, model, success, firstTokenMs)
+		return
+	}
 	scheduler.ReportResult(accountID, success, firstTokenMs)
+}
+
+// ReportOpenAIAccountScheduleUsage records upstream cache and account-cost
+// signals after a successful request. It is intentionally a no-op when the
+// advanced scheduler is disabled.
+func (s *OpenAIGatewayService) ReportOpenAIAccountScheduleUsage(accountID int64, model string, usage OpenAIAccountScheduleUsage) {
+	scheduler := s.getOpenAIAccountScheduler(context.Background())
+	if scheduler == nil {
+		return
+	}
+	if reporter, ok := scheduler.(interface {
+		ReportUsage(int64, string, OpenAIAccountScheduleUsage)
+	}); ok {
+		reporter.ReportUsage(accountID, model, usage)
+	}
 }
 
 func (s *OpenAIGatewayService) RecordOpenAIAccountSwitch() {

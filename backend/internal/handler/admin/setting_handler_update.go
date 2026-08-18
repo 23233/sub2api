@@ -277,6 +277,8 @@ type UpdateSettingsRequest struct {
 	OpenAIAdvancedSchedulerEnabled                     *bool    `json:"openai_advanced_scheduler_enabled"`
 	OpenAIAdvancedSchedulerStickyWeightedEnabled       *bool    `json:"openai_advanced_scheduler_sticky_weighted_enabled"`
 	OpenAIAdvancedSchedulerSubscriptionPriorityEnabled *bool    `json:"openai_advanced_scheduler_subscription_priority_enabled"`
+	OpenAIAdvancedSchedulerCacheMinRate                *float64 `json:"openai_advanced_scheduler_cache_min_rate"`
+	OpenAIAdvancedSchedulerCacheRecoveryMinutes        *int     `json:"openai_advanced_scheduler_cache_recovery_minutes"`
 	OpenAIAdvancedSchedulerLBTopK                      *string  `json:"openai_advanced_scheduler_lb_top_k"`
 	OpenAIAdvancedSchedulerWeightPriority              *string  `json:"openai_advanced_scheduler_weight_priority"`
 	OpenAIAdvancedSchedulerWeightLoad                  *string  `json:"openai_advanced_scheduler_weight_load"`
@@ -1818,6 +1820,18 @@ func (h *SettingHandler) UpdateSettings(c *gin.Context) {
 			}
 			return previousSettings.OpenAIAdvancedSchedulerSubscriptionPriorityEnabled
 		}(),
+		OpenAIAdvancedSchedulerCacheMinRate: func() float64 {
+			if req.OpenAIAdvancedSchedulerCacheMinRate != nil {
+				return *req.OpenAIAdvancedSchedulerCacheMinRate
+			}
+			return previousSettings.OpenAIAdvancedSchedulerCacheMinRate
+		}(),
+		OpenAIAdvancedSchedulerCacheRecoveryMinutes: func() int {
+			if req.OpenAIAdvancedSchedulerCacheRecoveryMinutes != nil {
+				return *req.OpenAIAdvancedSchedulerCacheRecoveryMinutes
+			}
+			return previousSettings.OpenAIAdvancedSchedulerCacheRecoveryMinutes
+		}(),
 		OpenAIAdvancedSchedulerLBTopK:                 stringSetting(req.OpenAIAdvancedSchedulerLBTopK, previousSettings.OpenAIAdvancedSchedulerLBTopK),
 		OpenAIAdvancedSchedulerWeightPriority:         stringSetting(req.OpenAIAdvancedSchedulerWeightPriority, previousSettings.OpenAIAdvancedSchedulerWeightPriority),
 		OpenAIAdvancedSchedulerWeightLoad:             stringSetting(req.OpenAIAdvancedSchedulerWeightLoad, previousSettings.OpenAIAdvancedSchedulerWeightLoad),
@@ -2286,6 +2300,8 @@ func (h *SettingHandler) UpdateSettings(c *gin.Context) {
 		OpenAIAdvancedSchedulerEnabled:                         updatedSettings.OpenAIAdvancedSchedulerEnabled,
 		OpenAIAdvancedSchedulerStickyWeightedEnabled:           updatedSettings.OpenAIAdvancedSchedulerStickyWeightedEnabled,
 		OpenAIAdvancedSchedulerSubscriptionPriorityEnabled:     updatedSettings.OpenAIAdvancedSchedulerSubscriptionPriorityEnabled,
+		OpenAIAdvancedSchedulerCacheMinRate:                    updatedSettings.OpenAIAdvancedSchedulerCacheMinRate,
+		OpenAIAdvancedSchedulerCacheRecoveryMinutes:            updatedSettings.OpenAIAdvancedSchedulerCacheRecoveryMinutes,
 		OpenAIAdvancedSchedulerLBTopK:                          updatedSettings.OpenAIAdvancedSchedulerLBTopK,
 		OpenAIAdvancedSchedulerWeightPriority:                  updatedSettings.OpenAIAdvancedSchedulerWeightPriority,
 		OpenAIAdvancedSchedulerWeightLoad:                      updatedSettings.OpenAIAdvancedSchedulerWeightLoad,
